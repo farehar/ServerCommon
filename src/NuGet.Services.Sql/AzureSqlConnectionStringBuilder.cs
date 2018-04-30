@@ -1,13 +1,16 @@
 ﻿// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
 
+using System;
+using System.ComponentModel;
 using System.Data.Common;
 using System.Globalization;
 
 namespace NuGet.Services.Sql
 {
     /// <summary>
-    /// Custom connection string 
+    /// Builder for SQL server connections which support AAD token-based authentication with
+    /// <see cref="AzureSqlConnectionFactory"/>.
     /// </summary>
     public class AzureSqlConnectionStringBuilder : DbConnectionStringBuilder
     {
@@ -19,7 +22,8 @@ namespace NuGet.Services.Sql
 
         public string AadCertificate { get; }
 
-        public string AadCertificatePassword { get; }
+        [DefaultValue(true)]
+        public bool AadSendX5c { get; }
 
         public string AadAuthority { get; }
 
@@ -27,10 +31,10 @@ namespace NuGet.Services.Sql
         {
             ConnectionString = connectionString;
 
-            AadTenant = Ingest("AadTenant");
-            AadClientId = Ingest("AadClientId");
-            AadCertificate = Ingest("AadCertificate");
-            AadCertificatePassword = Ingest("AadCertificatePassword");
+            AadTenant = Ingest<string>(nameof(AadTenant));
+            AadClientId = Ingest<string>(nameof(AadClientId));
+            AadCertificate = Ingest<string>(nameof(AadCertificate));
+            AadSendX5c = Ingest(nameof(AadSendX5c), defaultValue: true);
 
             if (!string.IsNullOrEmpty(AadTenant))
             {
@@ -38,12 +42,13 @@ namespace NuGet.Services.Sql
             }
         }
 
-        private string Ingest(string propertyName)
+        private T Ingest<T>(string propertyName, T defaultValue = default(T))
         {
-            string result = string.Empty;
+            T result = defaultValue;
             if (ContainsKey(propertyName))
             {
-                result = this[propertyName] as string;
+                var value = this[propertyName] as string;
+                result = (T)Convert.ChangeType(value, typeof(T));
                 Remove(propertyName);
             }
             return result;

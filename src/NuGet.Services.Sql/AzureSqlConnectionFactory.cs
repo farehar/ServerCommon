@@ -3,6 +3,7 @@
 
 using System;
 using System.Data.SqlClient;
+using System.Linq;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading.Tasks;
 using Microsoft.IdentityModel.Clients.ActiveDirectory;
@@ -18,13 +19,16 @@ namespace NuGet.Services.Sql
 
         public AzureSqlConnectionStringBuilder ConnectionStringBuilder { get; }
 
-        private ISecretReader SecretReader { get; }
-
-        public ICachingSecretReader CachingSecretReader { get; }
-
         public ISecretInjector SecretInjector { get; }
 
-        public AzureSqlConnectionFactory(string connectionString, ISecretReader secretReader)
+        public ISecretReader SecretReader {
+            get
+            {
+                return SecretInjector.SecretReader;
+            }
+        }
+
+        public AzureSqlConnectionFactory(string connectionString, ISecretInjector secretInjector)
         {
             if (string.IsNullOrEmpty(connectionString))
             {
@@ -32,35 +36,33 @@ namespace NuGet.Services.Sql
             }
 
             ConnectionStringBuilder = new AzureSqlConnectionStringBuilder(connectionString);
-            SecretReader = secretReader ?? throw new ArgumentNullException(nameof(secretReader));
-
-            CachingSecretReader = secretReader as ICachingSecretReader;
-            SecretInjector = new SecretInjector(secretReader);
+            SecretInjector = secretInjector ?? throw new ArgumentNullException(nameof(secretInjector));
         }
-        
+
         public async Task<SqlConnection> CreateAsync()
         {
             try
             {
                 return await ConnectAsync();
             }
-            catch (Exception)
+            catch (Exception e) when (IsAdalException(e))
             {
                 await Task.Delay(RetryIntervalInMilliseconds);
 
-                return await ConnectAsync(forceRefresh: true);
+                RefreshSecrets();
+
+                return await ConnectAsync();
             }
         }
 
-        protected virtual async Task<SqlConnection> ConnectAsync(bool forceRefresh = false)
+        protected virtual async Task<SqlConnection> ConnectAsync()
         {
-            var connectionString = await SecretInjector.InjectAsync(ConnectionStringBuilder.ConnectionString, forceRefresh);
-
+            var connectionString = await SecretInjector.InjectAsync(ConnectionStringBuilder.ConnectionString);
             var connection = new SqlConnection(connectionString);
 
             if (!string.IsNullOrWhiteSpace(ConnectionStringBuilder.AadAuthority))
             {
-                connection.AccessToken = await GetAccessTokenAsync(forceRefresh);
+                connection.AccessToken = await GetAccessTokenAsync();
             }
 
             await OpenConnectionAsync(connection);
@@ -68,19 +70,15 @@ namespace NuGet.Services.Sql
             return connection;
         }
 
-        private async Task<string> GetAccessTokenAsync(bool forceRefresh)
+        private async Task<string> GetAccessTokenAsync()
         {
-            var password = await SecretInjector.InjectAsync(ConnectionStringBuilder.AadCertificatePassword, forceRefresh);
+            var certificate = await GetCertificateSecretAsync(ConnectionStringBuilder.AadCertificate);
 
-            // Parse certificate secret name with injector so that we can use the same syntax as string secrets.
-            var certificateSecret = SecretInjector.GetSecretName(ConnectionStringBuilder.AadCertificate);
-            if (forceRefresh)
-            {
-                CachingSecretReader?.RefreshCertificateSecret(certificateSecret);
-            }
-            var certificate = await SecretReader.GetCertificateSecretAsync(certificateSecret, password);
+            var authenticationContext = new AuthenticationContext(ConnectionStringBuilder.AadAuthority);
+            var clientAssertion = new ClientAssertionCertificate(ConnectionStringBuilder.AadClientId, certificate);
 
-            return await AcquireTokenAsync(ConnectionStringBuilder.AadAuthority, ConnectionStringBuilder.AadClientId, certificate);
+            var result = await authenticationContext.AcquireTokenAsync(AzureSqlResourceId, clientAssertion, ConnectionStringBuilder.AadSendX5c);
+            return result.AccessToken;
         }
 
         protected virtual Task OpenConnectionAsync(SqlConnection sqlConnection)
@@ -88,13 +86,40 @@ namespace NuGet.Services.Sql
             return sqlConnection.OpenAsync();
         }
 
-        protected virtual async Task<string> AcquireTokenAsync(string authority, string clientId, X509Certificate2 certificate)
+        private async Task<X509Certificate2> GetCertificateSecretAsync(string input)
         {
-            var authenticationContext = new AuthenticationContext(ConnectionStringBuilder.AadAuthority);
-            var clientAssertion = new ClientAssertionCertificate(ConnectionStringBuilder.AadClientId, certificate);
+            var certSecret = GetSecretName(ConnectionStringBuilder.AadCertificate);
+            var secret = await SecretReader.GetSecretAsync(certSecret);
+            return new X509Certificate2(Convert.FromBase64String(secret), string.Empty);
+        }
 
-            var result = await authenticationContext.AcquireTokenAsync(AzureSqlResourceId, clientAssertion);
-            return result.AccessToken;
+        private void RefreshSecrets()
+        {
+            var cachingSecretReader = SecretReader as ICachingSecretReader;   
+            if (cachingSecretReader != null)
+            {
+                foreach (var secret in SecretInjector.GetSecretNames(ConnectionStringBuilder.ConnectionString))
+                {
+                    cachingSecretReader.RefreshSecret(secret);
+                }
+
+                var certSecret = GetSecretName(ConnectionStringBuilder.AadCertificate);
+                if (!string.IsNullOrEmpty(certSecret))
+                {
+                    cachingSecretReader.RefreshSecret(certSecret);
+                }
+            }
+        }
+
+        private string GetSecretName(string input)
+        {
+            return SecretInjector.GetSecretNames(input).SingleOrDefault();
+        }
+
+        private static bool IsAdalException(Exception e)
+        {
+            return (e is AdalException) ? true
+                : (e.InnerException != null) ? IsAdalException(e.InnerException) : false;
         }
     }
 }
